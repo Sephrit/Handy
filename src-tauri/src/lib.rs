@@ -193,12 +193,14 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     #[cfg(unix)]
     signal_handle::setup_signal_handler(app_handle.clone(), signals);
 
-    // Apply macOS Accessory policy if starting hidden and tray is available.
-    // If the tray icon is disabled, keep the dock icon so the user can reopen.
+    // Apply macOS Accessory policy whenever we start hidden, regardless of the tray.
+    // The dock icon is not needed as a reopen affordance: relaunching the app hits the
+    // single-instance handler, which calls show_main_window() and restores Regular policy.
+    // This lets a tray-less, hidden start be genuinely invisible instead of dock-only.
     #[cfg(target_os = "macos")]
     {
         let settings = settings::get_settings(app_handle);
-        if settings.start_hidden && settings.show_tray_icon {
+        if settings.start_hidden {
             let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
         }
     }
@@ -939,10 +941,11 @@ pub fn run(cli_args: CliArgs) {
             let should_hide = settings.start_hidden || cli_args.start_hidden;
             let should_force_show = should_force_show_permissions_window(&app_handle);
 
-            // If start_hidden but tray is disabled, we must show the window
-            // anyway. Without a tray icon, the dock is the only way back in.
-            let tray_available = settings.show_tray_icon && !cli_args.no_tray;
-            if should_force_show || !should_hide || !tray_available {
+            // A tray-less hidden start no longer forces the window open. Relaunching the
+            // app reaches the running instance via the single-instance handler, which
+            // calls show_main_window(), so settings stay reachable without a dock icon.
+            // Permission onboarding still forces the window via should_force_show.
+            if should_force_show || !should_hide {
                 show_main_window(&app_handle);
             }
 
@@ -958,8 +961,10 @@ pub fn run(cli_args: CliArgs) {
                     let settings = get_settings(window.app_handle());
                     let tray_visible =
                         settings.show_tray_icon && !window.app_handle().state::<CliArgs>().no_tray;
-                    if tray_visible {
-                        // Tray is available: hide the dock icon, app lives in the tray
+                    // Mirror the startup rule: a background app (tray-backed or
+                    // hidden-by-default) drops its dock icon on close. Relaunching brings the
+                    // window back via the single-instance handler, so this strands nobody.
+                    if tray_visible || settings.start_hidden {
                         let res = window
                             .app_handle()
                             .set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -967,7 +972,6 @@ pub fn run(cli_args: CliArgs) {
                             log::error!("Failed to set activation policy: {}", e);
                         }
                     }
-                    // No tray: keep the dock icon visible so the user can reopen
                 }
             }
             tauri::WindowEvent::ThemeChanged(theme) => {

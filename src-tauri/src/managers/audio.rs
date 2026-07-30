@@ -20,6 +20,143 @@ use tauri::Manager;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const VAD_THRESHOLD: f32 = 0.3;
 
+/// Direct CoreAudio access to the default output device's mute property.
+///
+/// The AppleScript path (`osascript -e "set volume output muted ..."`) costs
+/// ~110ms per call because it spawns and initializes a scripting interpreter.
+/// Muting snapshots the previous state first, so the shell path spent ~220ms
+/// before the audio actually went quiet — plainly audible at the start of a
+/// recording. These property calls are in-process and take microseconds.
+///
+/// Not every output device exposes a settable mute property (some USB DACs and
+/// aggregate devices don't), so both entry points report failure rather than
+/// silently doing nothing, and the callers fall back to AppleScript.
+#[cfg(target_os = "macos")]
+mod macos_mute {
+    use std::os::raw::c_void;
+
+    type OSStatus = i32;
+    type AudioObjectID = u32;
+
+    #[repr(C)]
+    struct AudioObjectPropertyAddress {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    const fn fourcc(s: &[u8; 4]) -> u32 {
+        ((s[0] as u32) << 24) | ((s[1] as u32) << 16) | ((s[2] as u32) << 8) | (s[3] as u32)
+    }
+
+    const SYSTEM_OBJECT: AudioObjectID = 1;
+    const DEFAULT_OUTPUT_DEVICE: u32 = fourcc(b"dOut");
+    const PROPERTY_MUTE: u32 = fourcc(b"mute");
+    const SCOPE_GLOBAL: u32 = fourcc(b"glob");
+    const SCOPE_OUTPUT: u32 = fourcc(b"outp");
+    const ELEMENT_MAIN: u32 = 0;
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    extern "C" {
+        fn AudioObjectGetPropertyData(
+            id: AudioObjectID,
+            address: *const AudioObjectPropertyAddress,
+            qualifier_size: u32,
+            qualifier: *const c_void,
+            io_size: *mut u32,
+            out_data: *mut c_void,
+        ) -> OSStatus;
+
+        fn AudioObjectSetPropertyData(
+            id: AudioObjectID,
+            address: *const AudioObjectPropertyAddress,
+            qualifier_size: u32,
+            qualifier: *const c_void,
+            size: u32,
+            data: *const c_void,
+        ) -> OSStatus;
+
+        fn AudioObjectIsPropertySettable(
+            id: AudioObjectID,
+            address: *const AudioObjectPropertyAddress,
+            out_settable: *mut u8,
+        ) -> OSStatus;
+    }
+
+    fn addr(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress {
+            selector,
+            scope,
+            element: ELEMENT_MAIN,
+        }
+    }
+
+    fn default_output_device() -> Option<AudioObjectID> {
+        let address = addr(DEFAULT_OUTPUT_DEVICE, SCOPE_GLOBAL);
+        let mut device: AudioObjectID = 0;
+        let mut size = std::mem::size_of::<AudioObjectID>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut device as *mut _ as *mut c_void,
+            )
+        };
+        // Device ID 0 is kAudioObjectUnknown — treat it as no usable device.
+        (status == 0 && device != 0).then_some(device)
+    }
+
+    /// Reads the default output device's mute flag. `None` if unavailable.
+    pub fn get_mute() -> Option<bool> {
+        let device = default_output_device()?;
+        let address = addr(PROPERTY_MUTE, SCOPE_OUTPUT);
+        let mut muted: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut muted as *mut _ as *mut c_void,
+            )
+        };
+        (status == 0).then(|| muted != 0)
+    }
+
+    /// Sets the default output device's mute flag. Returns false when the
+    /// device has no settable mute property, so the caller can fall back.
+    pub fn set_mute(mute: bool) -> bool {
+        let Some(device) = default_output_device() else {
+            return false;
+        };
+        let address = addr(PROPERTY_MUTE, SCOPE_OUTPUT);
+
+        let mut settable: u8 = 0;
+        let status = unsafe { AudioObjectIsPropertySettable(device, &address, &mut settable) };
+        if status != 0 || settable == 0 {
+            return false;
+        }
+
+        let value: u32 = if mute { 1 } else { 0 };
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                device,
+                &address,
+                0,
+                std::ptr::null(),
+                std::mem::size_of::<u32>() as u32,
+                &value as *const _ as *const c_void,
+            )
+        };
+        status == 0
+    }
+}
+
 fn set_mute(mute: bool) {
     // Expected behavior:
     // - Windows: works on most systems using standard audio drivers.
@@ -100,6 +237,11 @@ fn set_mute(mute: bool) {
 
     #[cfg(target_os = "macos")]
     {
+        // Fast path first; AppleScript only if this device has no settable mute.
+        if macos_mute::set_mute(mute) {
+            return;
+        }
+
         use std::process::Command;
         let script = format!(
             "set volume output muted {}",
@@ -198,6 +340,11 @@ fn get_mute() -> Option<bool> {
 
 #[cfg(target_os = "macos")]
 fn get_mute() -> Option<bool> {
+    // Fast path first; AppleScript only if CoreAudio can't answer.
+    if let Some(muted) = macos_mute::get_mute() {
+        return Some(muted);
+    }
+
     use std::process::Command;
 
     let out = Command::new("osascript")
@@ -454,6 +601,29 @@ impl AudioRecordingManager {
     }
 
     /* ---------- microphone life-cycle -------------------------------------- */
+
+    /// Waits for the microphone stream to report open, up to `timeout`.
+    /// Returns whether it opened in time.
+    ///
+    /// `apply_mute` no-ops while the stream is closed, so callers used to sleep a
+    /// flat 100ms first to dodge that race. In practice `try_start_recording` has
+    /// already brought the stream up before it returns, so that sleep was dead time
+    /// the user heard as a late mute. Polling keeps the same ceiling for devices
+    /// that genuinely are slow to open, without charging everyone else for it.
+    pub fn wait_for_stream_open(&self, timeout: Duration) -> bool {
+        const POLL_INTERVAL: Duration = Duration::from_millis(2);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let open = *self.is_open.lock().unwrap();
+            if open {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
 
     /// Applies mute if mute_while_recording is enabled and stream is open.
     /// Snapshots the system's prior mute state first so `remove_mute` can

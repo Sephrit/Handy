@@ -558,12 +558,19 @@ impl ShortcutAction for TranscribeAction {
             match rm.try_start_recording(&binding_id, vad_policy) {
                 Ok(()) => {
                     debug!("Recording started in {:?}", recording_start_time.elapsed());
-                    // Small delay to ensure microphone stream is active
+                    // Wait only as long as the microphone stream actually needs,
+                    // capped at the old fixed delay.
                     let app_clone = app.clone();
                     let rm_clone = Arc::clone(&rm);
                     std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        debug!("Handling delayed audio feedback/mute sequence");
+                        let mute_wait = Instant::now();
+                        let opened =
+                            rm_clone.wait_for_stream_open(std::time::Duration::from_millis(100));
+                        debug!(
+                            "Stream ready for mute after {:?} (opened={})",
+                            mute_wait.elapsed(),
+                            opened
+                        );
                         // Helper handles disabled audio feedback by returning early, so we reuse it
                         // to keep mute sequencing consistent in every mode.
                         play_feedback_sound_blocking(&app_clone, SoundType::Start);

@@ -42,3 +42,7 @@ blob-report/
 
 # Nix build output
 result
+
+# repowise index — local cache, never commit
+.repowise/
+.mcp.json
